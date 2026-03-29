@@ -1,0 +1,122 @@
+We want to create a kong plugin to achieve below flow 
+
+kong session should run in cookie mode
+kong does not have access to database as we do not have backend
+
+we should be able to execute below flow
+
+1. if request containst a heder create_session = true 
+2. create a session and store all session data in cookie.
+3. cookie should store session data like ID, last used time
+4.  encrypt the cookie and sign it like the default session plugin does
+5. When the net request comes which a session cookie
+    a. this plugin should validate the session with the cookie and ensure that cookie is not tempered
+    b. validate the last used time in cookie and validated against idle timeout 
+    c. update the last used time in cookie
+    d. destroy the cookie if all validation rule fails
+6. if validation rull succssul allow the flow to continue
+
+We dont want interaction with any database as session should run in cookie mode
+
+
+
+
+You are an expert Kong plugin developer with deep knowledge of the Kong Gateway plugin development framework (PDK), Lua programming, and session management security.
+
+## Task
+Create a production-ready custom Kong plugin named `cookie-session` that implements stateless session management entirely via encrypted, signed cookies — with NO database or storage backend required.
+
+## Plugin Requirements
+
+### 1. Session Creation
+- Trigger session creation when an incoming request contains the HTTP header `create_session: true`
+- Generate a cryptographically random session ID (UUID v4 or equivalent, using `kong.utils` or `openssl.rand`)
+- Record the current timestamp as `created_at` and `last_used_at`
+- Build a session payload object:
+```json
+  {
+    "id": "<uuid>",
+    "created_at": <unix_timestamp>,
+    "last_used_at": <unix_timestamp>
+  }
+```
+- Serialize the payload to JSON, then:
+  1. **Encrypt** using AES-256-GCM with a secret key from plugin config
+  2. **Sign** using HMAC-SHA256 with a separate signing secret from plugin config
+  3. Base64URL-encode the result
+- Set the resulting value as a `Set-Cookie` response header with attributes:
+  - `HttpOnly`
+  - `Secure`
+  - `SameSite=Strict`
+  - `Path=/`
+  - Configurable `Max-Age` (default: 0 for session cookie)
+  - Configurable cookie name (default: `kong_session`)
+
+### 2. Session Validation (Subsequent Requests)
+When a request arrives carrying the session cookie:
+
+a. **Tamper Detection**
+   - Extract the cookie value
+   - Verify the HMAC signature — reject immediately if invalid (respond with `401 Unauthorized`)
+
+b. **Decryption**
+   - Decrypt the payload using AES-256-GCM
+   - Parse the JSON — reject with `401` if malformed
+
+c. **Idle Timeout Check**
+   - Compare `last_used_at` against the current time
+   - If `(now - last_used_at) > idle_timeout_seconds`, the session is expired:
+     - Respond with `401 Unauthorized`
+     - Instruct the client to clear the cookie via `Set-Cookie: <name>=; Max-Age=0; ...`
+
+d. **Rolling Session Update**
+   - If validation passes, update `last_used_at` to the current timestamp
+   - Re-encrypt, re-sign, and re-issue the cookie via `Set-Cookie` in the response
+   - Allow the request to proceed
+
+### 3. Failure Behaviour
+- Any validation failure (bad signature, decryption error, expired session, malformed data) must:
+  - Return `HTTP 401 Unauthorized` with a JSON body: `{"message": "Session invalid or expired"}`
+  - Set `Set-Cookie: <name>=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Strict` to destroy the cookie
+
+## Plugin Configuration Schema
+Expose the following configurable fields in `schema.lua`:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `cookie_name` | string | `"kong_session"` | Name of the session cookie |
+| `encryption_secret` | string | required | 32-byte hex string for AES-256-GCM encryption |
+| `signing_secret` | string | required | Secret for HMAC-SHA256 signing |
+| `idle_timeout` | number | `3600` | Seconds before an idle session expires |
+| `cookie_secure` | boolean | `true` | Set Secure flag on cookie |
+| `cookie_same_site` | string | `"Strict"` | SameSite policy: Strict, Lax, or None |
+| `cookie_path` | string | `"/"` | Cookie Path attribute |
+
+## File Structure to Generate
+Produce all files needed for a complete Kong plugin:
+
+## Technical Constraints
+- Use only Kong PDK (`kong.*`) and Lua standard libraries
+- Use `kong.request`, `kong.response`, `kong.log`
+- Use `ngx.now()` for timestamps
+- Use `kong.utils.uuid()` for session ID generation
+- For crypto, use `require("resty.openssl")` or `require("resty.aes")` and `require("resty.hmac")` — whichever is available in the Kong runtime
+- The plugin must work in `access` phase (use `handler:access()`)
+- No `init_worker`, `rewrite`, or `header_filter` phases are needed — all logic including cookie re-issuance should happen in the access phase via `kong.response.set_header` or in the `header_filter` phase if cookie re-issuance requires it
+
+## Security Requirements
+- The encryption key and signing secret must never be logged
+- Use authenticated encryption (AES-GCM) so that encryption and tamper detection are combined — HMAC can serve as a secondary layer
+- Cookie value format (after Base64URL encoding): `<iv>.<ciphertext>.<tag>.<hmac>` — clearly document this format
+- Ensure timing-safe comparison for HMAC verification using `ngx.decode_base64` + constant-time compare
+
+## Output Format
+For each file, provide:
+1. The full file path
+2. The complete, runnable Lua code (no placeholders or pseudocode)
+3. Inline comments explaining non-obvious logic
+
+After the code, provide:
+- A `curl` example demonstrating session creation (`create_session: true` header)
+- A `curl` example demonstrating a valid follow-up request with the session cookie
+- A `curl` example demonstrating what happens when the session has expired
